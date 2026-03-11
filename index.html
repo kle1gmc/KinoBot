@@ -11,6 +11,20 @@
 		<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
 		<link rel="stylesheet" href="assets/css/main.css" />
 		<noscript><link rel="stylesheet" href="assets/css/noscript.css" /></noscript>
+		<style>
+			#header nav ul li a {
+				font-size: 0.7rem !important; /* Чуть уменьшаем шрифт */
+				letter-spacing: 0.1rem !important; /* Уменьшаем расстояние между буквами */
+				padding: 1rem 1.2rem !important; /* Делаем отступы поменьше */
+			}
+			/* Фикс для мобильных телефонов, чтобы там тоже всё было ровно */
+			@media screen and (max-width: 736px) {
+				#header nav ul li a {
+					font-size: 0.6rem !important;
+					padding: 0.8rem 1rem !important;
+				}
+			}
+		</style>
 	</head>
 	<body class="is-preload">
 
@@ -20,8 +34,8 @@
 				<!-- Header (Главный экран) -->
 					<header id="header">
 						<div class="logo">
-							<!-- Иконка кинопленки -->
-							<span class="icon fa-film"></span>
+							<!-- Аватарка бота -->
+							<img src="images/avatar.jpg" alt="Аватар бота" style="width: 100%; height: 100%; border-radius: 50%; object-fit: cover; display: block;" />
 						</div>
 						<div class="content">
 							<div class="inner">
