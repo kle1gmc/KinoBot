@@ -3,6 +3,7 @@ import asyncio
 import io
 import os
 import random
+import re
 from urllib.parse import urlparse
 
 import aiohttp
@@ -19,7 +20,7 @@ from reportlab.lib.utils import ImageReader
 
 from . import state
 from .state import user_sessions, user_filters
-from .config import bot, dp, TMDB_TOKEN, DATABASE_URL
+from .config import bot, dp, TMDB_TOKEN, DATABASE_URL, ADMIN_IDS
 from .constants import GENRES_MOVIE, GENRES_TV, COUNTRY_FLAGS
 
 # -------------------- DB INIT --------------------
@@ -45,9 +46,25 @@ async def init_db():
                             disable_cartoons BOOLEAN DEFAULT FALSE,
                             hide_watched boolean DEFAULT false,
                             agreement_accepted BOOLEAN DEFAULT FALSE,
-                            agreement_accepted_at TIMESTAMP
+                            agreement_accepted_at TIMESTAMP,
+                            age_confirmed BOOLEAN DEFAULT FALSE,
+                            age_confirmed_at TIMESTAMP,
+                            is_adult BOOLEAN DEFAULT NULL
                            );
                            """)
+        await conn.execute("""
+            ALTER TABLE users 
+            ADD COLUMN IF NOT EXISTS age_confirmed BOOLEAN DEFAULT FALSE;
+        """)
+        await conn.execute("""
+            ALTER TABLE users 
+            ADD COLUMN IF NOT EXISTS age_confirmed_at TIMESTAMP;
+        """)
+        await conn.execute("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS is_adult BOOLEAN DEFAULT NULL;
+        """)
+
         await conn.execute("""
                            CREATE TABLE IF NOT EXISTS collection
                            (
@@ -324,32 +341,42 @@ async def add_to_collection(tg_id: int, tmdb_id: int, type_: str, title: str, ye
 
 
 async def get_collection(tg_id: int, limit=4, offset=0):
+    """Возвращает коллекцию пользователя с учетом бана и возрастного ограничения.
+
+    Если пользователь не подтвердил 18+, контент с российской сертификацией 18+
+    или без распознанной сертификации не показывается даже в коллекции.
+    """
     async with state.db.acquire() as conn:
         user = await conn.fetchrow("SELECT user_id FROM users WHERE tg_id=$1", tg_id)
         if not user:
             return []
+
         rows = await conn.fetch("""
                                 SELECT *
                                 FROM collection
                                 WHERE user_id = $1
                                 ORDER BY added_at DESC
-                                    LIMIT $2
-                                OFFSET $3
-                                """, user["user_id"], limit, offset)
-        return rows
+                                """, user["user_id"])
+
+    user_is_adult = await is_user_adult(tg_id)
+    visible_rows = []
+
+    for item in rows:
+        if await is_banned(item["tmdb_id"], item["type"]):
+            continue
+
+        if not is_content_allowed_by_age(item["type"], item["tmdb_id"], user_is_adult):
+            continue
+
+        visible_rows.append(item)
+
+    return visible_rows[offset:offset + limit]
 
 
 async def get_collection_count(tg_id: int):
-    async with state.db.acquire() as conn:
-        user = await conn.fetchrow("SELECT user_id FROM users WHERE tg_id=$1", tg_id)
-        if not user:
-            return 0
-        row = await conn.fetchrow("""
-                                  SELECT COUNT(*)
-                                  FROM collection
-                                  WHERE user_id = $1
-                                  """, user["user_id"])
-        return row["count"]
+    """Количество элементов коллекции, видимых конкретному пользователю."""
+    collection = await get_collection(tg_id, limit=100000, offset=0)
+    return len(collection)
 
 
 async def remove_from_collection(tg_id: int, tmdb_id: int, type_: str):
@@ -723,6 +750,46 @@ async def deactivate_subscription(tg_id: int):
 
         return True
 
+async def check_user_age_confirmation(tg_id: int) -> bool:
+    """Проверяет, выбрал ли пользователь возрастной статус."""
+    async with state.db.acquire() as conn:
+        user = await conn.fetchrow(
+            "SELECT age_confirmed FROM users WHERE tg_id=$1",
+            tg_id
+        )
+        return bool(user and user["age_confirmed"])
+
+
+async def accept_user_age_confirmation(tg_id: int, is_adult: bool):
+    """Сохраняет возрастной статус пользователя.
+
+    is_adult=True  -> пользователь подтвердил 18+.
+    is_adult=False -> пользователь указал, что ему нет 18, но бот не блокирует доступ,
+                      а включает фильтрацию 18+ контента.
+    """
+    async with state.db.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE users
+            SET age_confirmed = TRUE,
+                age_confirmed_at = $1,
+                is_adult = $2
+            WHERE tg_id = $3
+            """,
+            datetime.now(), is_adult, tg_id
+        )
+
+
+async def is_user_adult(tg_id: int) -> bool:
+    """Возвращает True только если пользователь подтвердил 18+."""
+    async with state.db.acquire() as conn:
+        result = await conn.fetchval(
+            "SELECT is_adult FROM users WHERE tg_id=$1",
+            tg_id
+        )
+        return result is True
+
+
 async def check_user_agreement(tg_id: int) -> bool:
     """Проверяет, принял ли пользователь соглашение"""
     async with state.db.acquire() as conn:
@@ -755,7 +822,192 @@ def tmdb_get(url: str, params: dict):
     return requests.get(url, headers=headers, params=params, timeout=10)
 
 
-async def discover_tmdb(type_: str, genre_id: int | None = None, vote_count_min: int = 50, filters: dict = None):
+RU_CERTIFICATION_ORDER = {
+    "NR": 0,
+    "0+": 1,
+    "6+": 2,
+    "12+": 3,
+    "16+": 4,
+    "18+": 5,
+}
+
+MAX_MINOR_RU_ORDER = 4
+
+
+def normalize_ru_certification(certification: str | None) -> str | None:
+    """Приводит российскую возрастную сертификацию TMDB к единому виду."""
+    if certification is None:
+        return None
+
+    cert = str(certification).strip().upper().replace(" ", "")
+
+    if not cert:
+        return None
+    if cert in {"0", "0+"}:
+        return "0+"
+    if cert in {"6", "6+"}:
+        return "6+"
+    if cert in {"12", "12+"}:
+        return "12+"
+    if cert in {"16", "16+"}:
+        return "16+"
+    if cert in {"18", "18+"}:
+        return "18+"
+    if cert == "NR":
+        return "NR"
+
+    return cert
+
+
+def get_ru_certification_order(certification: str | None) -> int | None:
+    """Возвращает order российской сертификации по справочнику TMDB."""
+    cert = normalize_ru_certification(certification)
+    if cert is None:
+        return None
+
+    return RU_CERTIFICATION_ORDER.get(cert)
+
+
+def is_ru_certification_allowed_for_minor(certification: str | None) -> bool:
+    """Проверяет, можно ли показать контент пользователю младше 18 лет.
+
+    Используется порядок российских сертификаций TMDB:
+    NR = 0, 0+ = 1, 6+ = 2, 12+ = 3, 16+ = 4, 18+ = 5.
+    Несовершеннолетним показывается только контент с order от 1 до 4.
+    18+ и отсутствие рейтинга скрываются.
+    """
+    order = get_ru_certification_order(certification)
+
+    if order is None:
+        return False
+
+    # NR означает отсутствие рейтинговой информации, поэтому скрываем для безопасности.
+    if order == 0:
+        return False
+
+    return order <= MAX_MINOR_RU_ORDER
+
+
+def get_movie_age_rating(movie_id: int) -> str | None:
+    """Получает российский возрастной рейтинг фильма через /movie/{id}/release_dates.
+
+    Важно: TMDB может вернуть несколько российских дат релиза. Пустые certification
+    игнорируются. Если найдено несколько непустых российских сертификаций, берется
+    самая строгая по order из справочника TMDB. Например, 16+ разрешается, 18+ скрывается.
+    """
+    url = f"https://api.themoviedb.org/3/movie/{movie_id}/release_dates"
+
+    try:
+        r = tmdb_get(url, {})
+    except Exception as e:
+        print(f"AGE_FILTER_DEBUG: movie {movie_id}: ошибка запроса release_dates: {e}")
+        return None
+
+    if r.status_code != 200:
+        print(f"AGE_FILTER_DEBUG: movie {movie_id}: release_dates status={r.status_code}")
+        return None
+
+    countries = r.json().get("results", [])
+    ru_certifications = []
+    ru_block_found = False
+
+    for country in countries:
+        if country.get("iso_3166_1") != "RU":
+            continue
+
+        ru_block_found = True
+        for release in country.get("release_dates", []):
+            cert = normalize_ru_certification(release.get("certification"))
+
+            # Пустые значения не считаем возрастным рейтингом.
+            if not cert:
+                continue
+
+            if cert in RU_CERTIFICATION_ORDER:
+                ru_certifications.append(cert)
+
+    if not ru_block_found:
+        print(f"AGE_FILTER_DEBUG: movie {movie_id}: RU-блок не найден")
+        return None
+
+    if not ru_certifications:
+        print(f"AGE_FILTER_DEBUG: movie {movie_id}: RU-блок есть, но сертификация пустая")
+        return None
+
+    chosen = max(ru_certifications, key=lambda cert: RU_CERTIFICATION_ORDER[cert])
+    print(
+        f"AGE_FILTER_DEBUG: movie {movie_id}: RU certifications={ru_certifications}, "
+        f"chosen={chosen}, order={RU_CERTIFICATION_ORDER[chosen]}"
+    )
+    return chosen
+
+
+def get_tv_age_rating(tv_id: int) -> str | None:
+    """Получает российский возрастной рейтинг сериала через /tv/{id}/content_ratings."""
+    url = f"https://api.themoviedb.org/3/tv/{tv_id}/content_ratings"
+
+    try:
+        r = tmdb_get(url, {"language": "ru-RU"})
+    except Exception as e:
+        print(f"AGE_FILTER_DEBUG: tv {tv_id}: ошибка запроса content_ratings: {e}")
+        return None
+
+    if r.status_code != 200:
+        print(f"AGE_FILTER_DEBUG: tv {tv_id}: content_ratings status={r.status_code}")
+        return None
+
+    ratings = r.json().get("results", [])
+
+    for item in ratings:
+        if item.get("iso_3166_1") == "RU":
+            rating = normalize_ru_certification(item.get("rating"))
+            print(f"AGE_FILTER_DEBUG: tv {tv_id}: RU rating={rating}")
+            return rating
+
+    print(f"AGE_FILTER_DEBUG: tv {tv_id}: RU rating не найден")
+    return None
+
+
+def is_content_allowed_by_age(type_: str, tmdb_id: int, is_adult: bool) -> bool:
+    """Проверяет, можно ли показать контент пользователю.
+
+    Для пользователей младше 18 лет используется российская сертификация TMDB:
+    0+, 6+, 12+ и 16+ разрешены, 18+ скрывается.
+    Если российский рейтинг отсутствует или не распознан, контент скрывается.
+    """
+    if is_adult:
+        return True
+
+    if type_ == "movie":
+        rating = get_movie_age_rating(tmdb_id)
+    elif type_ == "tv":
+        rating = get_tv_age_rating(tmdb_id)
+    else:
+        print(f"AGE_FILTER_DEBUG: unknown type={type_}, id={tmdb_id}")
+        return False
+
+    allowed = is_ru_certification_allowed_for_minor(rating)
+    print(
+        f"AGE_FILTER_DEBUG: type={type_}, id={tmdb_id}, rating={rating}, "
+        f"is_adult={is_adult}, allowed={allowed}"
+    )
+    return allowed
+
+
+async def filter_items_by_age(items: list, type_: str, is_adult: bool):
+    """Фильтрует список фильмов/сериалов по возрасту пользователя."""
+    if is_adult:
+        return items
+
+    filtered = []
+    for item in items:
+        item_id = item.get("id")
+        if item_id and is_content_allowed_by_age(type_, item_id, is_adult):
+            filtered.append(item)
+    return filtered
+
+
+async def discover_tmdb(type_: str, genre_id: int | None = None, vote_count_min: int = 50, filters: dict = None, is_adult: bool = True):
     base_url = f"https://api.themoviedb.org/3/discover/{type_}"
     common = {
         "language": "ru-RU",
@@ -767,6 +1019,12 @@ async def discover_tmdb(type_: str, genre_id: int | None = None, vote_count_min:
 
     if genre_id:
         common["with_genres"] = genre_id
+
+    # Для несовершеннолетних дополнительно ограничиваем фильмы по сертификации TMDB.
+    # Для сериалов отдельная проверка выполняется ниже через /tv/{id}/content_ratings.
+    if is_adult is False and type_ == "movie":
+        common["certification_country"] = "RU"
+        common["certification.lte"] = "16+"
 
     # Применяем дополнительные фильтры
     if filters:
@@ -806,7 +1064,7 @@ async def discover_tmdb(type_: str, genre_id: int | None = None, vote_count_min:
 
     # Если ничего не нашли, пробуем снизить порог голосов
     if not results and vote_count_min > 10:
-        return await discover_tmdb(type_, genre_id=genre_id, vote_count_min=10, filters=filters)
+        return await discover_tmdb(type_, genre_id=genre_id, vote_count_min=10, filters=filters, is_adult=is_adult)
 
     # Фильтруем забаненный контент
     async def filter_banned_items(items):
@@ -817,7 +1075,101 @@ async def discover_tmdb(type_: str, genre_id: int | None = None, vote_count_min:
         return filtered_items
 
     results = await filter_banned_items(results)
+
+    if is_adult is False:
+        results = await filter_items_by_age(results, type_, is_adult)
+
     return results
+
+
+
+def get_genres_text(details: dict) -> str:
+    """Возвращает строку с жанрами для карточки контента."""
+    genres = details.get("genres") or []
+    names = []
+    for genre in genres:
+        if isinstance(genre, dict) and genre.get("name"):
+            names.append(str(genre["name"]))
+
+    if not names:
+        genres_text = "🎭 Жанры: не указаны"
+    else:
+        genres_text = "🎭 Жанры: " + ", ".join(names[:5])
+
+    return f"{genres_text}\n{get_production_countries_text(details)}"
+
+
+def get_production_countries_text(details: dict) -> str:
+    """Возвращает красивую строку со странами производства для карточки."""
+    country_codes = []
+
+    for country in details.get("production_countries", []) or []:
+        code = country.get("iso_3166_1") if isinstance(country, dict) else None
+        if code:
+            country_codes.append(str(code).upper())
+
+    for code in details.get("origin_country", []) or []:
+        if code:
+            country_codes.append(str(code).upper())
+
+    unique_codes = []
+    for code in country_codes:
+        if code not in unique_codes:
+            unique_codes.append(code)
+
+    if not unique_codes:
+        return "🌍 Страна: не указана"
+
+    countries = [
+        f"{get_country_flag(code)} {get_country_ru_name(code)}"
+        for code in unique_codes[:3]
+    ]
+
+    if len(unique_codes) > 3:
+        countries.append(f"и еще {len(unique_codes) - 3}")
+
+    label = "Страна" if len(unique_codes) == 1 else "Страны"
+    return f"🌍 {label}: " + ", ".join(countries)
+
+
+def append_limited_overview(caption: str, overview: str | None, max_length: int = 1024) -> str:
+    """Добавляет описание к caption так, чтобы не превысить лимит Telegram для фото."""
+    separator = "\n\n"
+    empty_text = "Описание отсутствует."
+    overview = (overview or "").strip()
+
+    if not overview or overview == empty_text:
+        plain_caption = caption + separator + empty_text
+        return plain_caption if len(plain_caption) <= max_length else caption[:max_length - 3] + "..."
+
+    quote_open = "<blockquote expandable>"
+    quote_close = "</blockquote>"
+    base = caption + separator
+    available = max_length - len(base) - len(quote_open) - len(quote_close)
+
+    if available <= 0:
+        return caption[:max_length - 3] + "..."
+
+    if len(overview) > available:
+        overview = overview[:max(0, available - 3)].rstrip() + "..."
+
+    return f"{base}{quote_open}{overview}{quote_close}"
+
+
+def append_watch_providers(caption: str, type_: str, tmdb_id: int, max_length: int = 1024) -> str:
+    """Добавляет строку с провайдерами просмотра, если она помещается в caption."""
+    try:
+        providers = get_providers_ru(type_, tmdb_id)
+        if not providers:
+            return caption
+
+        providers_text = f"\n\nГде смотреть: {providers}"
+        if len(caption) + len(providers_text) <= max_length:
+            return caption + providers_text
+    except Exception:
+        pass
+
+    return caption
 
 
 def get_item_details(type_: str, tmdb_id: int):
@@ -935,6 +1287,7 @@ def kb_main():
 def kb_search_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎲 Случайный поиск", callback_data="random_search")],
+        [InlineKeyboardButton(text="🧭 Случайный поиск по жанрам", callback_data="search_genre")],
         [InlineKeyboardButton(text="🔍 Поиск по названию", callback_data="search_by_title")],
         [InlineKeyboardButton(text="🎭 Поиск по актеру", callback_data="search_by_person")],
         [InlineKeyboardButton(text="🎯 На основе предпочтений", callback_data="preferences")],
@@ -947,7 +1300,6 @@ def kb_random_search():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎬 Случайный фильм", callback_data="discover_movie")],
         [InlineKeyboardButton(text="📺 Случайный сериал", callback_data="discover_tv")],
-        [InlineKeyboardButton(text="🧭 Случайный поиск по жанрам", callback_data="search_genre")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="search_menu")],
     ])
 
@@ -967,6 +1319,7 @@ def kb_my_profile():
     """Клавиатура меню профиля"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить профиль", callback_data="update_profile")],
+        [InlineKeyboardButton(text="🔞 Подтвердить возраст заново", callback_data="profile_reconfirm_age")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_to_main")],
     ])
 
@@ -1167,7 +1520,253 @@ async def kb_ban_confirmation(tmdb_id: int, type_: str, title: str):
 
 def get_country_flag(country_code: str) -> str:
     """Возвращает флаг страны или код, если флаг не найден"""
-    return COUNTRY_FLAGS.get(country_code, country_code)
+    country_code = (country_code or "").upper()
+    if country_code in LEGACY_COUNTRY_CODES:
+        return "🌐"
+
+    if country_code in COUNTRY_FLAGS:
+        return COUNTRY_FLAGS[country_code]
+
+    if len(country_code) == 2 and country_code.isalpha():
+        return "".join(chr(ord(char) + 127397) for char in country_code)
+
+    return country_code
+
+
+def get_country_ru_name(country_code: str, fallback_name: str | None = None) -> str:
+    country_code = (country_code or "").upper()
+    return COUNTRY_RU_NAMES.get(country_code) or fallback_name or country_code
+
+
+_tmdb_countries_cache: list[dict] | None = None
+
+LEGACY_COUNTRY_CODES = {"AN", "BU", "CS", "DD", "SU", "TP", "YU", "ZR", "XC", "XG", "XI"}
+
+COUNTRY_ALIASES = {
+    "рф": "RU", "российская федерация": "RU", "russia": "RU",
+    "сша": "US", "штаты": "US", "америка": "US", "usa": "US", "united states": "US",
+    "великобритания": "GB", "англия": "GB", "uk": "GB", "britain": "GB", "england": "GB",
+    "корея": "KR", "южная корея": "KR", "korea": "KR", "south korea": "KR",
+    "северная корея": "KP", "north korea": "KP",
+    "китай": "CN", "china": "CN",
+    "япония": "JP", "japan": "JP",
+    "германия": "DE", "germany": "DE",
+    "франция": "FR", "france": "FR",
+    "италия": "IT", "italy": "IT",
+    "испания": "ES", "spain": "ES",
+    "индия": "IN", "india": "IN",
+    "бразилия": "BR", "brazil": "BR"
+}
+
+COUNTRY_RU_NAMES = {
+    "AD": "Андорра", "AE": "ОАЭ", "AF": "Афганистан", "AG": "Антигуа и Барбуда",
+    "AI": "Ангилья", "AL": "Албания", "AM": "Армения", "AO": "Ангола",
+    "AQ": "Антарктида", "AR": "Аргентина", "AS": "Американское Самоа", "AT": "Австрия",
+    "AU": "Австралия", "AW": "Аруба", "AX": "Аландские острова", "AZ": "Азербайджан",
+    "BA": "Босния и Герцеговина", "BB": "Барбадос", "BD": "Бангладеш", "BE": "Бельгия",
+    "BF": "Буркина-Фасо", "BG": "Болгария", "BH": "Бахрейн", "BI": "Бурунди",
+    "BJ": "Бенин", "BL": "Сен-Бартелеми", "BM": "Бермуды", "BN": "Бруней",
+    "BO": "Боливия", "BQ": "Карибские Нидерланды", "BR": "Бразилия", "BS": "Багамы",
+    "BT": "Бутан", "BV": "Остров Буве", "BW": "Ботсвана", "BY": "Беларусь",
+    "BZ": "Белиз", "CA": "Канада", "CC": "Кокосовые острова", "CD": "ДР Конго",
+    "CF": "ЦАР", "CG": "Республика Конго", "CH": "Швейцария", "CI": "Кот-д’Ивуар",
+    "CK": "Острова Кука", "CL": "Чили", "CM": "Камерун", "CN": "Китай",
+    "CO": "Колумбия", "CR": "Коста-Рика", "CU": "Куба", "CV": "Кабо-Верде",
+    "CW": "Кюрасао", "CX": "Остров Рождества", "CY": "Кипр", "CZ": "Чехия",
+    "DE": "Германия", "DJ": "Джибути", "DK": "Дания", "DM": "Доминика",
+    "DO": "Доминиканская Республика", "DZ": "Алжир", "EC": "Эквадор", "EE": "Эстония",
+    "EG": "Египет", "EH": "Западная Сахара", "ER": "Эритрея", "ES": "Испания",
+    "ET": "Эфиопия", "FI": "Финляндия", "FJ": "Фиджи", "FK": "Фолклендские острова",
+    "FM": "Микронезия", "FO": "Фарерские острова", "FR": "Франция", "GA": "Габон",
+    "GB": "Великобритания", "GD": "Гренада", "GE": "Грузия", "GF": "Французская Гвиана",
+    "GG": "Гернси", "GH": "Гана", "GI": "Гибралтар", "GL": "Гренландия",
+    "GM": "Гамбия", "GN": "Гвинея", "GP": "Гваделупа", "GQ": "Экваториальная Гвинея",
+    "GR": "Греция", "GS": "Южная Георгия и Южные Сандвичевы острова", "GT": "Гватемала",
+    "GU": "Гуам", "GW": "Гвинея-Бисау", "GY": "Гайана", "HK": "Гонконг",
+    "HM": "Остров Херд и острова Макдональд", "HN": "Гондурас", "HR": "Хорватия",
+    "HT": "Гаити", "HU": "Венгрия", "ID": "Индонезия", "IE": "Ирландия",
+    "IL": "Израиль", "IM": "Остров Мэн", "IN": "Индия", "IO": "Британская территория в Индийском океане",
+    "IQ": "Ирак", "IR": "Иран", "IS": "Исландия", "IT": "Италия",
+    "JE": "Джерси", "JM": "Ямайка", "JO": "Иордания", "JP": "Япония",
+    "KE": "Кения", "KG": "Кыргызстан", "KH": "Камбоджа", "KI": "Кирибати",
+    "KM": "Коморы", "KN": "Сент-Китс и Невис", "KP": "Северная Корея", "KR": "Южная Корея",
+    "KW": "Кувейт", "KY": "Каймановы острова", "KZ": "Казахстан", "LA": "Лаос",
+    "LB": "Ливан", "LC": "Сент-Люсия", "LI": "Лихтенштейн", "LK": "Шри-Ланка",
+    "LR": "Либерия", "LS": "Лесото", "LT": "Литва", "LU": "Люксембург",
+    "LV": "Латвия", "LY": "Ливия", "MA": "Марокко", "MC": "Монако",
+    "MD": "Молдова", "ME": "Черногория", "MF": "Сен-Мартен", "MG": "Мадагаскар",
+    "MH": "Маршалловы Острова", "MK": "Северная Македония", "ML": "Мали", "MM": "Мьянма",
+    "MN": "Монголия", "MO": "Макао", "MP": "Северные Марианские острова", "MQ": "Мартиника",
+    "MR": "Мавритания", "MS": "Монтсеррат", "MT": "Мальта", "MU": "Маврикий",
+    "MV": "Мальдивы", "MW": "Малави", "MX": "Мексика", "MY": "Малайзия",
+    "MZ": "Мозамбик", "NA": "Намибия", "NC": "Новая Каледония", "NE": "Нигер",
+    "NF": "Остров Норфолк", "NG": "Нигерия", "NI": "Никарагуа", "NL": "Нидерланды",
+    "NO": "Норвегия", "NP": "Непал", "NR": "Науру", "NU": "Ниуэ",
+    "NZ": "Новая Зеландия", "OM": "Оман", "PA": "Панама", "PE": "Перу",
+    "PF": "Французская Полинезия", "PG": "Папуа — Новая Гвинея", "PH": "Филиппины",
+    "PK": "Пакистан", "PL": "Польша", "PM": "Сен-Пьер и Микелон", "PN": "Питкэрн",
+    "PR": "Пуэрто-Рико", "PS": "Палестина", "PT": "Португалия", "PW": "Палау",
+    "PY": "Парагвай", "QA": "Катар", "RE": "Реюньон", "RO": "Румыния",
+    "RS": "Сербия", "RU": "Россия", "RW": "Руанда", "SA": "Саудовская Аравия",
+    "SB": "Соломоновы Острова", "SC": "Сейшелы", "SD": "Судан", "SE": "Швеция",
+    "SG": "Сингапур", "SH": "Остров Святой Елены", "SI": "Словения", "SJ": "Шпицберген и Ян-Майен",
+    "SK": "Словакия", "SL": "Сьерра-Леоне", "SM": "Сан-Марино", "SN": "Сенегал",
+    "SO": "Сомали", "SR": "Суринам", "SS": "Южный Судан", "ST": "Сан-Томе и Принсипи",
+    "SV": "Сальвадор", "SX": "Синт-Мартен", "SY": "Сирия", "SZ": "Эсватини",
+    "TC": "Теркс и Кайкос", "TD": "Чад", "TF": "Французские Южные территории",
+    "TG": "Того", "TH": "Таиланд", "TJ": "Таджикистан", "TK": "Токелау",
+    "TL": "Восточный Тимор", "TM": "Туркменистан", "TN": "Тунис", "TO": "Тонга",
+    "TR": "Турция", "TT": "Тринидад и Тобаго", "TV": "Тувалу", "TW": "Тайвань",
+    "TZ": "Танзания", "UA": "Украина", "UG": "Уганда", "UM": "Внешние малые острова США",
+    "US": "США", "UY": "Уругвай", "UZ": "Узбекистан", "VA": "Ватикан",
+    "VC": "Сент-Винсент и Гренадины", "VE": "Венесуэла", "VG": "Британские Виргинские острова",
+    "VI": "Виргинские острова США", "VN": "Вьетнам", "VU": "Вануату", "WF": "Уоллис и Футуна",
+    "WS": "Самоа", "YE": "Йемен", "YT": "Майотта", "ZA": "ЮАР",
+    "ZM": "Замбия", "ZW": "Зимбабве",
+    "AN": "Нидерландские Антильские острова", "BU": "Бирма", "CS": "Сербия и Черногория",
+    "DD": "Восточная Германия", "SU": "Советский Союз", "TP": "Восточный Тимор",
+    "YU": "Югославия", "ZR": "Заир", "XC": "Чехословакия", "XG": "Восточная Германия",
+    "XI": "Северная Ирландия", "XK": "Косово",
+}
+
+
+def get_tmdb_countries() -> list[dict]:
+    """Возвращает список стран TMDB для выбора фильтра страны."""
+    global _tmdb_countries_cache
+
+    if _tmdb_countries_cache is not None:
+        return _tmdb_countries_cache
+
+    fallback_countries = [
+        {"code": "RU", "name": get_country_ru_name("RU"), "search_names": ["Россия", "Russia", "RU"]},
+        {"code": "US", "name": get_country_ru_name("US"), "search_names": ["США", "United States", "USA", "US"]},
+        {"code": "GB", "name": get_country_ru_name("GB"), "search_names": ["Великобритания", "United Kingdom", "GB"]},
+        {"code": "FR", "name": get_country_ru_name("FR"), "search_names": ["Франция", "France", "FR"]},
+        {"code": "DE", "name": get_country_ru_name("DE"), "search_names": ["Германия", "Germany", "DE"]},
+        {"code": "JP", "name": get_country_ru_name("JP"), "search_names": ["Япония", "Japan", "JP"]},
+        {"code": "KR", "name": get_country_ru_name("KR"), "search_names": ["Южная Корея", "South Korea", "KR"]},
+        {"code": "CN", "name": get_country_ru_name("CN"), "search_names": ["Китай", "China", "CN"]},
+        {"code": "IN", "name": get_country_ru_name("IN"), "search_names": ["Индия", "India", "IN"]},
+        {"code": "IT", "name": get_country_ru_name("IT"), "search_names": ["Италия", "Italy", "IT"]},
+        {"code": "ES", "name": get_country_ru_name("ES"), "search_names": ["Испания", "Spain", "ES"]},
+        {"code": "BR", "name": get_country_ru_name("BR"), "search_names": ["Бразилия", "Brazil", "BR"]},
+    ]
+
+    try:
+        response = tmdb_get(
+            "https://api.themoviedb.org/3/configuration/countries",
+            {"language": "ru-RU"}
+        )
+        if response.status_code != 200:
+            _tmdb_countries_cache = fallback_countries
+            return _tmdb_countries_cache
+
+        countries = []
+        for item in response.json():
+            code = (item.get("iso_3166_1") or "").upper()
+            native_name = item.get("native_name") or ""
+            english_name = item.get("english_name") or ""
+            fallback_name = native_name or english_name or code
+            name = get_country_ru_name(code, fallback_name)
+            if code:
+                countries.append({
+                    "code": code,
+                    "name": name,
+                    "search_names": [name, native_name, english_name, code],
+                })
+
+        _tmdb_countries_cache = sorted(countries, key=lambda country: country["name"].lower())
+        return _tmdb_countries_cache
+    except Exception as e:
+        print(f"TMDB countries loading error: {e}")
+        _tmdb_countries_cache = fallback_countries
+        return _tmdb_countries_cache
+
+
+def get_country_display_name(country_code: str) -> str:
+    country_code = (country_code or "").upper()
+    for country in get_tmdb_countries():
+        if country["code"] == country_code:
+            return country["name"]
+    return get_country_ru_name(country_code)
+
+
+def normalize_country_query(query: str) -> str:
+    return re.sub(r"[^0-9a-zа-яё]+", "", (query or "").casefold())
+
+
+def find_country_by_query(query: str) -> dict | None:
+    normalized_query = normalize_country_query(query)
+    if not normalized_query:
+        return None
+
+    normalized_aliases = {
+        normalize_country_query(alias): code
+        for alias, code in COUNTRY_ALIASES.items()
+    }
+    alias_code = normalized_aliases.get(normalized_query)
+
+    countries = get_tmdb_countries()
+    if alias_code:
+        for country in countries:
+            if country["code"] == alias_code:
+                return country
+        return {"code": alias_code, "name": get_country_display_name(alias_code)}
+
+    for country in countries:
+        country_code = country["code"]
+        if normalized_query == normalize_country_query(country_code):
+            return country
+
+        search_names = country.get("search_names") or [country.get("name"), country_code]
+        for country_name in search_names:
+            if normalized_query == normalize_country_query(country_name):
+                return country
+
+    return None
+
+
+def kb_country_selection(current_filters: dict, page: int = 0, countries_per_page: int = 8):
+    countries = get_tmdb_countries()
+    total_pages = max((len(countries) + countries_per_page - 1) // countries_per_page, 1)
+    page = max(0, min(page, total_pages - 1))
+    start = page * countries_per_page
+    page_countries = countries[start:start + countries_per_page]
+    selected_country = (current_filters or {}).get("country")
+
+    keyboard = []
+
+    if selected_country:
+        selected_name = get_country_display_name(selected_country)
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"✅ Сейчас: {get_country_flag(selected_country)} {selected_name}",
+                callback_data="country_current"
+            )
+        ])
+
+    for country in page_countries:
+        code = country["code"]
+        marker = "✅ " if selected_country == code else ""
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"{marker}{get_country_flag(code)} {country['name']} ({code})",
+                callback_data=f"set_country_{code}"
+            )
+        ])
+
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"country_page_{page - 1}"))
+    navigation.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="country_current"))
+    if page < total_pages - 1:
+        navigation.append(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"country_page_{page + 1}"))
+
+    keyboard.append(navigation)
+    keyboard.append([InlineKeyboardButton(text="🌍 Любая страна", callback_data="clear_country")])
+    keyboard.append([InlineKeyboardButton(text="⬅️ К фильтрам", callback_data="country_back_filters")])
+
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 def kb_filters_menu(current_filters: dict):
     # Отображаем год/диапазон
@@ -1185,7 +1784,8 @@ def kb_filters_menu(current_filters: dict):
     country_value = current_filters.get('country')
     if country_value:
         country_flag = get_country_flag(country_value)
-        country_btn = f"🌍 Страна: {country_flag}"
+        country_name = get_country_display_name(country_value)
+        country_btn = f"🌍 Страна: {country_flag} {country_name}"
     else:
         country_btn = "🌍 Страна: Любая"
 
@@ -1513,9 +2113,7 @@ async def remove_friend(user_tg_id: int, friend_tg_id: int):
         return True
 
 def is_admin(chat_id: int) -> bool:
-    # Здесь можешь добавить проверку по ID админов
-    admin_ids = [950764975]  # Замени на реальные ID админов
-    return chat_id in admin_ids
+    return chat_id in ADMIN_IDS
 
 
 async def generate_stats_pdf(stats_data: dict, sort_by: str):
@@ -1951,6 +2549,7 @@ def kb_genres(type_: str):
             row = []
     if row:
         keyboard.append(row)
+    keyboard.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="search_genre")])
     keyboard.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_to_main")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 

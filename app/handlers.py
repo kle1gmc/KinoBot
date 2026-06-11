@@ -20,17 +20,35 @@ from .state import user_sessions, user_filters, user_input_waiting
 from .config import bot, dp
 from .support import *
 
+
+async def can_show_content_to_user(tg_id: int, type_: str, tmdb_id: int) -> bool:
+    """Единая проверка видимости контента для пользователя.
+
+    Возрастное ограничение должно работать во всех сценариях: случайный поиск,
+    поиск по названию, рекомендации, коллекция и экспорт.
+    """
+    if await is_banned(tmdb_id, type_):
+        return False
+
+    user_is_adult = await is_user_adult(tg_id)
+    return is_content_allowed_by_age(type_, tmdb_id, user_is_adult)
+
 def require_agreement_message(handler):
     """Декоратор для проверки соглашения в обработчиках сообщений"""
 
     async def wrapper(message: types.Message, *args, **kwargs):
         chat_id = message.chat.id
 
-        # Проверяем принятие соглашения
         user = await get_user_by_tg_id(chat_id)
         if not user or not user.get('agreement_accepted'):
             await message.answer(
                 "❌ Для использования бота необходимо принять пользовательское соглашение. Отправьте /start"
+            )
+            return
+
+        if not user.get('age_confirmed'):
+            await message.answer(
+                "🔞 Для использования бота необходимо выбрать возрастной статус. Отправьте /start"
             )
             return
 
@@ -50,11 +68,17 @@ def require_agreement_callback(handler):
     async def wrapper(callback: types.CallbackQuery, *args, **kwargs):
         chat_id = callback.message.chat.id
 
-        # Проверяем принятие соглашения
         user = await get_user_by_tg_id(chat_id)
         if not user or not user.get('agreement_accepted'):
             await callback.answer(
                 "❌ Для использования бота необходимо принять пользовательское соглашение. Отправьте /start",
+                show_alert=True
+            )
+            return
+
+        if not user.get('age_confirmed'):
+            await callback.answer(
+                "🔞 Для использования бота необходимо выбрать возрастной статус. Отправьте /start",
                 show_alert=True
             )
             return
@@ -90,12 +114,17 @@ async def search_by_tmdb_id(message: types.Message):
         await message.answer("❌ Этот контент заблокирован администратором и недоступен для просмотра.")
         return
 
+    if not await can_show_content_to_user(message.chat.id, type_, tmdb_id):
+        await message.answer("🔞 Этот контент недоступен из-за возрастного ограничения.")
+        return
+
     if not details:
         await message.answer("❌ Не удалось найти фильм или сериал с таким TMDB ID.")
         return
     title = details.get("title") or details.get("name") or "Без названия"
     year = (details.get("release_date") or details.get("first_air_date") or "")[:4]
     rating = details.get("vote_average") or "—"
+    genre_text = get_genres_text(details)
     overview = details.get("overview") or "Описание отсутствует."
     if len(overview) > 2000:
         overview = overview[:2000] + "..."
@@ -106,9 +135,9 @@ async def search_by_tmdb_id(message: types.Message):
     if user_rating and user_rating["watched"]:
         watched_text = "✅ Вы смотрели"
 
-    def create_safe_caption(title, year, rating, avg_ratings, watched_text, overview):
+    def create_safe_caption(title, year, rating, avg_ratings, watched_text, overview, genre_text):
         """Создает caption гарантированно не длиннее 1024 символов"""
-        base_info = f"{title} ({year})\n⭐ {rating} | 👍 {avg_ratings['likes']} | 👎 {avg_ratings['dislikes']} | 👀 {avg_ratings['watches']}"
+        base_info = f"{title} ({year})\n⭐ {rating} | 👍 {avg_ratings['likes']} | 👎 {avg_ratings['dislikes']} | 👀 {avg_ratings['watches']}\n{genre_text}"
         if watched_text:
             base_info += f"\n{watched_text}"
 
@@ -127,7 +156,7 @@ async def search_by_tmdb_id(message: types.Message):
         return base_info + overview
 
     # Используйте так:
-    caption = create_safe_caption(title, year, rating, avg_ratings, watched_text, overview)
+    caption = create_safe_caption(title, year, rating, avg_ratings, watched_text, overview, genre_text)
 
     # Добавляем информацию о провайдерах для РФ (если есть)
     try:
@@ -332,25 +361,34 @@ async def start(message: types.Message):
     chat_id = message.chat.id
     username = message.from_user.username
 
-    await update_user_username(chat_id, username)
+    user = await get_or_create_user(chat_id, username)
 
-    # Проверяем, есть ли пользователь в базе и принял ли он соглашение
-    user = await get_user_by_tg_id(chat_id)
-
-    if not user:
-        # Пользователя нет - показываем соглашение
+    # Сначала пользователь принимает соглашение, потом выбирает возраст.
+    if not user.get('agreement_accepted'):
         await show_user_agreement(message)
         return
 
-    # Проверяем, принял ли пользователь соглашение
-    agreement_accepted = await check_user_agreement(chat_id)
-    if not agreement_accepted:
-        # Пользователь есть, но соглашение не принял - показываем снова
-        await show_user_agreement(message)
+    if not user.get('age_confirmed'):
+        await show_age_confirmation(message)
         return
 
-    # Пользователь есть и соглашение принято - показываем главное меню
     await show_main_menu(message)
+
+
+async def show_age_confirmation(message: types.Message):
+    """Показывает выбор возрастного статуса"""
+    age_text = (
+        "🔞 <b>Подтверждение возраста</b>\n\n"
+        "Укажите, достигли ли вы возраста 18 лет.\n\n"
+        "Если вам нет 18 лет, бот продолжит работать, но будет скрывать контент 18+."
+    )
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Мне есть 18 лет", callback_data="accept_age")],
+        [InlineKeyboardButton(text="🔞 Мне нет 18 лет", callback_data="reject_age")]
+    ])
+
+    await message.answer(age_text, parse_mode="HTML", reply_markup=keyboard)
 
 
 async def show_user_agreement(message: types.Message):
@@ -416,6 +454,43 @@ async def show_user_agreement(message: types.Message):
             parse_mode="Markdown",
             reply_markup=keyboard
         )
+
+
+async def show_profile_age_confirmation(message: types.Message):
+    """Повторное подтверждение возраста из профиля с отправкой пользовательского соглашения."""
+    agreement_text = (
+        "📋 <b>Пользовательское соглашение</b>\n\n"
+        "Перед повторным подтверждением возраста ознакомьтесь с пользовательским соглашением.\n\n"
+        "После выбора возрастного статуса бот обновит настройки фильтрации контента для вашего аккаунта."
+    )
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Мне есть 18 лет", callback_data="profile_accept_age")],
+        [InlineKeyboardButton(text="🔞 Мне нет 18 лет", callback_data="profile_reject_age")],
+        [InlineKeyboardButton(text="⬅️ Вернуться к профилю", callback_data="my_profile")],
+    ])
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    file_path = os.path.join(base_dir, "user_agreementv2.pdf")
+
+    if os.path.exists(file_path):
+        try:
+            agreement_file = types.FSInputFile(file_path, filename="user_agreementv2.pdf")
+            await message.answer_document(
+                document=agreement_file,
+                caption=agreement_text,
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+            return
+        except Exception as e:
+            print(f"[ERROR] Ошибка отправки пользовательского соглашения при повторном подтверждении возраста: {type(e).__name__}: {e}")
+
+    await message.answer(
+        agreement_text,
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
 
 
 async def show_main_menu(message: types.Message):
@@ -569,18 +644,18 @@ async def handle_user_input(message: types.Message):
             await message.answer("Выберите тип поиска:", reply_markup=kb_search_menu())
             return
 
-        # ФИЛЬТРАЦИЯ ЗАБАНЕННОГО КОНТЕНТА
+        # Фильтрация забаненного и возрастного контента
         filtered_results = []
         for item in results:
             media_type = item.get("media_type")
             if media_type in ["movie", "tv"]:
-                if not await is_banned(item["id"], media_type):
+                if await can_show_content_to_user(chat_id, media_type, item["id"]):
                     filtered_results.append(item)
             else:
-                filtered_results.append(item)  # Для person и других типов не проверяем бан
+                filtered_results.append(item)
 
         if not filtered_results:
-            await message.answer("❌ Все найденные результаты заблокированы администратором")
+            await message.answer("❌ Ничего не найдено с учетом ограничений и фильтров")
             await message.answer("Выберите тип поиска:", reply_markup=kb_search_menu())
             return
 
@@ -631,31 +706,31 @@ async def handle_user_input(message: types.Message):
         await message.answer("📱 Функция контактов в разработке. Используйте ID для добавления друзей.")
         return
 
-    # Обработка ввода страны
-    if chat_id in user_input_waiting and user_input_waiting[chat_id].get("waiting_country"):
-        # Удаляем сообщение с инструкцией
-        try:
-            await bot.delete_message(chat_id, user_input_waiting[chat_id]["message_id"])
-        except:
-            pass
+    # Обработка ручного ввода страны во время выбора страны
+    if chat_id in user_input_waiting and user_input_waiting[chat_id].get("waiting_country_name"):
+        country = find_country_by_query(user_input)
 
-        if user_input.lower() == 'any':
-            if chat_id in user_sessions and "filters" in user_sessions[chat_id]:
-                user_sessions[chat_id]["filters"]["country"] = None
-                await save_search_filters(chat_id, user_sessions[chat_id]["filters"])
-            await message.answer("✅ Фильтр страны убран")
-        else:
-            if chat_id not in user_sessions:
-                user_sessions[chat_id] = {}
-            if "filters" not in user_sessions[chat_id]:
-                user_sessions[chat_id]["filters"] = {}
+        if not country:
+            current_filters = user_sessions.get(chat_id, {}).get("filters") or await get_current_filters(chat_id)
+            await message.answer(
+                "❌ Страна не найдена. Попробуйте написать иначе или выберите страну кнопкой.",
+                reply_markup=kb_country_selection(current_filters, page=0)
+            )
+            return
 
-            user_sessions[chat_id]["filters"]["country"] = user_input.upper()
-            await save_search_filters(chat_id, user_sessions[chat_id]["filters"])
-            await message.answer(f"✅ Страна установлена: {user_input}")
+        country_code = country["code"]
+        if chat_id not in user_sessions:
+            user_sessions[chat_id] = {}
+        if "filters" not in user_sessions[chat_id]:
+            user_sessions[chat_id]["filters"] = await get_current_filters(chat_id)
 
-        user_input_waiting[chat_id]["waiting_country"] = False
-        current_filters = user_sessions.get(chat_id, {}).get("filters", {})
+        user_sessions[chat_id]["filters"]["country"] = country_code
+        await save_search_filters(chat_id, user_sessions[chat_id]["filters"])
+        user_input_waiting[chat_id]["waiting_country_name"] = False
+
+        country_name = get_country_display_name(country_code)
+        current_filters = user_sessions[chat_id]["filters"]
+        await message.answer(f"✅ Страна установлена: {get_country_flag(country_code)} {country_name}")
         await message.answer("Настройте фильтры поиска:", reply_markup=kb_filters_menu(current_filters))
         return
 
@@ -677,7 +752,7 @@ async def handle_user_input(message: types.Message):
             await message.answer("✅ Фильтр года убран")
         else:
             # Парсим ввод
-            current_year = 2025
+            current_year = datetime.now().year
 
             try:
                 if '-' in user_input:
@@ -695,7 +770,7 @@ async def handle_user_input(message: types.Message):
                                 await save_search_filters(chat_id, user_sessions[chat_id]["filters"])
                                 await message.answer(f"✅ Диапазон установлен: {start_year}-{end_year}")
                             else:
-                                await message.answer("❌ Некорректный диапазон. Используйте года от 1920 до 2024")
+                                await message.answer(f"❌ Некорректный диапазон. Используйте года от 1920 до {current_year}")
                                 return
 
                         elif start_part and not end_part:  # От года: 2010-
@@ -706,7 +781,7 @@ async def handle_user_input(message: types.Message):
                                 await save_search_filters(chat_id, user_sessions[chat_id]["filters"])
                                 await message.answer(f"✅ Установлено: с {start_year} года")
                             else:
-                                await message.answer("❌ Некорректный год. Используйте года от 1920 до 2024")
+                                await message.answer(f"❌ Некорректный год. Используйте года от 1920 до {current_year}")
                                 return
 
                         elif not start_part and end_part:  # До года: -2020
@@ -717,7 +792,7 @@ async def handle_user_input(message: types.Message):
                                 await save_search_filters(chat_id, user_sessions[chat_id]["filters"])
                                 await message.answer(f"✅ Установлено: до {end_year} года")
                             else:
-                                await message.answer("❌ Некорректный год. Используйте года от 1920 до 2024")
+                                await message.answer(f"❌ Некорректный год. Используйте года от 1920 до {current_year}")
                                 return
                         else:
                             await message.answer("❌ Некорректный формат. Примеры: 2010, 2010-2020, 2010-, -2020")
@@ -734,7 +809,7 @@ async def handle_user_input(message: types.Message):
                         await save_search_filters(chat_id, user_sessions[chat_id]["filters"])
                         await message.answer(f"✅ Год установлен: {year}")
                     else:
-                        await message.answer("❌ Некорректный год. Используйте года от 1920 до 2024")
+                        await message.answer(f"❌ Некорректный год. Используйте года от 1920 до {current_year}")
                         return
 
             except ValueError:
@@ -956,7 +1031,8 @@ async def handle_discover(callback: types.CallbackQuery):
     # Получаем активные фильтры пользователя
     current_filters = await get_current_filters(chat_id)
 
-    items = await discover_tmdb(type_, filters=current_filters)
+    user_is_adult = await is_user_adult(chat_id)
+    items = await discover_tmdb(type_, filters=current_filters, is_adult=user_is_adult)
     if user_filters.get(chat_id, {}).get("exclude_watched"):
         items = await filter_watched_items(chat_id, items, type_)
     if not items:
@@ -974,6 +1050,8 @@ async def handle_discover(callback: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data == "back_to_main")
 async def back_to_main_handler(callback: types.CallbackQuery):
     chat_id = callback.message.chat.id
+    if chat_id in user_input_waiting:
+        user_input_waiting[chat_id]["waiting_country_name"] = False
     requests_info = await get_requests_info(chat_id)
 
     if requests_info["has_subscription"]:
@@ -1006,6 +1084,10 @@ async def my_profile_handler(callback: types.CallbackQuery):
 
     username_display = user['username'] or "не установлен"
     registration_date = user.get('agreement_accepted_at', 'N/A')
+    if user.get('age_confirmed'):
+        age_display = "🔞 Возраст: 18+" if user.get('is_adult') is True else "🛡️ Возраст: Нет 18+"
+    else:
+        age_display = "❔ Возраст: не указан"
 
     if isinstance(registration_date, datetime):
         registration_date = registration_date.strftime("%d.%m.%Y %H:%M")
@@ -1036,7 +1118,8 @@ async def my_profile_handler(callback: types.CallbackQuery):
         f"👤 <b>Ваш профиль</b>\n\n"
         f"🆔 ID: <code>{chat_id}</code>\n"
         f"📛 Username: @{username_display}\n"
-        f"📅 Регистрация: {registration_date}\n\n"
+        f"📅 Регистрация: {registration_date}\n"
+        f"{age_display}\n\n"
         f"📊 <b>Статистика:</b>\n"
         f"• 🎬 В коллекции: {collection_count}\n"
         f"• 👍 Лайков: {likes_count}\n"
@@ -1050,11 +1133,18 @@ async def my_profile_handler(callback: types.CallbackQuery):
     else:
         text += f"🔒 <b>Подписка не активна</b>\n📊 Запросов сегодня: {requests_info['today_requests']}/{requests_info['max_requests']}\n"
 
-    await callback.message.edit_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=kb_my_profile()
-    )
+    try:
+        await callback.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=kb_my_profile()
+        )
+    except TelegramBadRequest:
+        await callback.message.answer(
+            text,
+            parse_mode="HTML",
+            reply_markup=kb_my_profile()
+        )
 
 
 @dp.callback_query(lambda c: c.data == "update_profile")
@@ -1093,10 +1183,62 @@ async def update_profile_handler(callback: types.CallbackQuery):
     await callback.answer("✅ Профиль обновлен!")
 
 
+@dp.callback_query(lambda c: c.data == "profile_reconfirm_age")
+@require_agreement_callback
+async def profile_reconfirm_age_handler(callback: types.CallbackQuery):
+    """Отправляет пользовательское соглашение и кнопки повторного подтверждения возраста."""
+    await callback.answer()
+    await show_profile_age_confirmation(callback.message)
+
+
+@dp.callback_query(lambda c: c.data == "profile_accept_age")
+@require_agreement_callback
+async def profile_accept_age_handler(callback: types.CallbackQuery):
+    """Повторное подтверждение возраста: пользователь подтвердил 18+."""
+    chat_id = callback.message.chat.id
+
+    try:
+        await accept_user_age_confirmation(chat_id, True)
+        await callback.answer("✅ Возрастной статус обновлен", show_alert=True)
+        await callback.message.answer(
+            "✅ Возрастной статус обновлен: 18+.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="👤 Вернуться к профилю", callback_data="my_profile")],
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_to_main")],
+            ])
+        )
+    except Exception as e:
+        print(f"Error updating profile age status to adult: {e}")
+        await callback.answer("❌ Не удалось обновить возрастной статус", show_alert=True)
+
+
+@dp.callback_query(lambda c: c.data == "profile_reject_age")
+@require_agreement_callback
+async def profile_reject_age_handler(callback: types.CallbackQuery):
+    """Повторное подтверждение возраста: пользователь указал, что ему нет 18."""
+    chat_id = callback.message.chat.id
+
+    try:
+        await accept_user_age_confirmation(chat_id, False)
+        await callback.answer("✅ Возрастной статус обновлен", show_alert=True)
+        await callback.message.answer(
+            "✅ Возрастной статус обновлен. Для аккаунта включена фильтрация контента 18+.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="👤 Вернуться к профилю", callback_data="my_profile")],
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_to_main")],
+            ])
+        )
+    except Exception as e:
+        print(f"Error updating profile age status to minor: {e}")
+        await callback.answer("❌ Не удалось обновить возрастной статус", show_alert=True)
+
+
 @dp.callback_query(lambda c: c.data == "search_menu")
 async def search_menu_handler(callback: types.CallbackQuery):
     """Меню поиска с проверкой подписки"""
     chat_id = callback.message.chat.id
+    if chat_id in user_input_waiting:
+        user_input_waiting[chat_id]["waiting_country_name"] = False
     requests_info = await get_requests_info(chat_id)
 
     if requests_info["has_subscription"]:
@@ -1105,6 +1247,7 @@ async def search_menu_handler(callback: types.CallbackQuery):
         text = (
             "🔍 <b>Меню поиска</b>\n\n"
             "🎲 <b>Случайный поиск</b> - доступен бесплатно\n"
+            "🔒 <b>Случайный поиск по жанрам</b> - требует подписки\n"
             "🔒 <b>Остальные функции</b> - требуют подписки\n\n"
         )
 
@@ -1136,9 +1279,8 @@ async def random_search_handler(callback: types.CallbackQuery):
     else:
         text = (
             "🎲 <b>Случайный поиск</b>\n\n"
-            "🎬 <b>Случайный фильм/сериал</b> - доступен бесплатно\n"
-            "🔒 <b>Поиск по жанрам</b> - требует подписки\n\n"
-            "💫 <b>Подписка откроет поиск по жанрам!</b>"
+            "🎬 <b>Случайный фильм/сериал</b> - доступен бесплатно\n\n"
+            "💫 <b>Подписка откроет расширенные способы поиска!</b>"
         )
 
     keyboard = await get_random_search_keyboard(chat_id)
@@ -1351,7 +1493,7 @@ async def subscription_management_handler(callback: types.CallbackQuery):
             f"• 🔥 Тренды\n"
             f"• 📄 Экспорт коллекции\n"
             f"• 🎯 Рекомендации друзей\n"
-            f"• 🧭 Поиск по жанрам\n"
+            f"• 🧭 Случайный поиск по жанрам\n"
             f"<i>Для получения подписки обратитесь к администратору</i>"
         )
 
@@ -1412,9 +1554,9 @@ async def subscription_info_handler(callback: types.CallbackQuery):
         "• ♾️ <b>Безлимитные запросы</b> - ищите сколько угодно\n"
         "• ⚡ <b>Расширенные функции</b> - все возможности бота\n\n"
         "<b>Тарифы:</b>\n"
-        "• 1 месяц - 150 руб.\n"
-        "• 3 месяца - 390 руб. (экономия 13%)\n"
-        "• 12 месяцев - 1150 руб. (экономия 36%)\n\n"
+        "• 1 месяц - 75 руб.\n"
+        "• 3 месяца - 190 руб. (скидка 15%)\n"
+        "• 12 месяцев - 630 руб. (скидка 30%)\n\n"
         "<i>Для приобретения подписки обратитесь к администратору</i>",
         parse_mode="HTML",
         reply_markup=kb_subscription_info()
@@ -1667,6 +1809,78 @@ async def admin_search_user_handler(callback: types.CallbackQuery):
     )
 
 
+@dp.callback_query(lambda c: c.data == "accept_age")
+async def accept_age_handler(callback: types.CallbackQuery):
+    """Обработчик подтверждения возраста"""
+    chat_id = callback.message.chat.id
+    username = callback.from_user.username
+
+    try:
+        await callback.message.delete()
+    except Exception as e:
+        print(f"Error deleting age confirmation message: {e}")
+
+    try:
+        await get_or_create_user(chat_id, username)
+        await accept_user_age_confirmation(chat_id, True)
+
+        await callback.message.answer("✅ Возраст подтверждён: 18+.")
+
+        agreement_accepted = await check_user_agreement(chat_id)
+        if not agreement_accepted:
+            await show_user_agreement(callback.message)
+            return
+
+        await show_main_menu(callback.message)
+
+    except Exception as e:
+        print(f"Error accepting age confirmation: {e}")
+        await callback.answer("❌ Произошла ошибка. Попробуйте снова.", show_alert=True)
+
+
+@dp.callback_query(lambda c: c.data == "reject_age")
+async def reject_age_handler(callback: types.CallbackQuery):
+    """Пользователь указал, что ему нет 18 лет: доступ не блокируется, включается фильтрация 18+."""
+    chat_id = callback.message.chat.id
+    username = callback.from_user.username
+
+    try:
+        await callback.message.delete()
+    except Exception as e:
+        print(f"Error deleting age confirmation message: {e}")
+
+    try:
+        await get_or_create_user(chat_id, username)
+        await accept_user_age_confirmation(chat_id, False)
+
+        await callback.message.answer(
+            "✅ Возрастной статус сохранён.\n"
+            "Для вашего аккаунта включена фильтрация контента 18+."
+        )
+
+        agreement_accepted = await check_user_agreement(chat_id)
+        if not agreement_accepted:
+            await show_user_agreement(callback.message)
+            return
+
+        await show_main_menu(callback.message)
+
+    except Exception as e:
+        print(f"Error saving minor age status: {e}")
+        await callback.answer("❌ Произошла ошибка. Попробуйте снова.", show_alert=True)
+
+
+@dp.callback_query(lambda c: c.data == "restart_age")
+async def restart_age_handler(callback: types.CallbackQuery):
+    """Повторный показ подтверждения возраста"""
+    try:
+        await callback.message.delete()
+    except Exception as e:
+        print(f"Error deleting message: {e}")
+
+    await show_age_confirmation(callback.message)
+
+
 @dp.callback_query(lambda c: c.data == "accept_agreement")
 async def accept_agreement_handler(callback: types.CallbackQuery):
     """Обработчик принятия соглашения"""
@@ -1690,13 +1904,13 @@ async def accept_agreement_handler(callback: types.CallbackQuery):
             # Пользователя нет - создаем нового с принятым соглашением
             await create_user_with_agreement(chat_id, username)
 
-        # Показываем приветствие
-        await callback.message.answer(
-            "✅ Спасибо! Пользовательское соглашение принято.\n\n"
-            "Добро пожаловать в бот! 🎬"
-        )
+        await callback.message.answer("✅ Пользовательское соглашение принято.")
 
-        # Показываем главное меню
+        user = await get_user_by_tg_id(chat_id)
+        if not user or not user.get('age_confirmed'):
+            await show_age_confirmation(callback.message)
+            return
+
         await show_main_menu(callback.message)
 
     except Exception as e:
@@ -1741,10 +1955,15 @@ async def handle_callback(callback: types.CallbackQuery):
     data = callback.data
     old_msg_id = callback.message.message_id
 
-    if callback.data not in ["accept_agreement", "reject_agreement", "restart_agreement"]:
+    if callback.data not in ["accept_age", "reject_age", "restart_age", "accept_agreement", "reject_agreement", "restart_agreement"]:
         user = await get_user_by_tg_id(chat_id)
         if not user or not user.get('agreement_accepted'):
             await callback.answer("❌ Сначала примите пользовательское соглашение через /start", show_alert=True)
+            return
+
+        if not user.get('age_confirmed'):
+            await callback.answer("🔞 Сначала выберите возрастной статус через /start", show_alert=True)
+            await show_age_confirmation(callback.message)
             return
 
     # В handle_callback добавьте этот обработчик:
@@ -2316,6 +2535,10 @@ async def handle_callback(callback: types.CallbackQuery):
             await callback.answer("❌ Ошибка данных.")
             return
 
+        if not await can_show_content_to_user(chat_id, type_, tmdb_id):
+            await callback.answer("🔞 Этот контент недоступен из-за возрастного ограничения", show_alert=True)
+            return
+
         try:
             await bot.delete_message(chat_id, old_msg_id)
         except:
@@ -2330,6 +2553,7 @@ async def handle_callback(callback: types.CallbackQuery):
         title = details.get("title") or details.get("name") or "Без названия"
         year = (details.get("release_date") or details.get("first_air_date") or "")[:4]
         rating = details.get("vote_average") or "—"
+        genre_text = get_genres_text(details)
         overview = details.get("overview") or "Описание отсутствует."
         if len(overview) > 2000:
             overview = overview[:2000] + "..."
@@ -2361,26 +2585,13 @@ async def handle_callback(callback: types.CallbackQuery):
         # Формируем caption с информацией о ролях
         caption = (
             f"<b>{title}</b> ({year})\n"
-            f"⭐ {rating} | 👍 {avg_ratings['likes']} | 👎 {avg_ratings['dislikes']} | 👀 {avg_ratings['watches']}"
+            f"⭐ {rating} | 👍 {avg_ratings['likes']} | 👎 {avg_ratings['dislikes']} | 👀 {avg_ratings['watches']}\n"
+        f"{genre_text}"
         )
 
-        caption += "\n\n"
+        caption = append_limited_overview(caption, overview)
 
-        # Добавляем описание как раскрываемую цитату
-        if overview and overview != "Описание отсутствует.":
-            caption += f"<blockquote expandable>{overview}</blockquote>"
-        else:
-            caption += "Описание отсутствует."
-
-        # Добавляем информацию о провайдерах для РФ (если есть)
-        try:
-            prov = get_providers_ru(type_, tmdb_id)
-            if prov:
-                prov_text = f"\n\nГде смотреть: {prov}"
-                if len(caption) + len(prov_text) <= 1024:
-                    caption += prov_text
-        except Exception:
-            pass
+        caption = append_watch_providers(caption, type_, tmdb_id)
 
         # Определяем, откуда пришли - из поиска или из фильмографии
         is_from_filmography = "filmography" in user_sessions.get(chat_id, {})
@@ -2745,10 +2956,11 @@ async def handle_callback(callback: types.CallbackQuery):
                 else:
                     filter_text += f"• Года: {current_filters['start_year']}-{current_filters['end_year']}\n"
             if current_filters.get('country'):
-                filter_text += f"• Страна: {current_filters['country']}\n"
+                country_code = current_filters['country']
+                filter_text += f"• Страна: {get_country_flag(country_code)} {get_country_display_name(country_code)}\n"
             if current_filters.get('rating'):
                 filter_text += f"• Рейтинг: {current_filters['rating']}+\n"
-            filter_text += "\nФильтры применяются к:\n• Случайный поиск\n• Поиск по жанрам"
+            filter_text += "\nФильтры применяются к:\n• Случайный поиск\n• Случайный поиск по жанрам"
         else:
             filter_text = "❌ Фильтры не активны"
 
@@ -3050,23 +3262,78 @@ async def handle_callback(callback: types.CallbackQuery):
 
     # Переключение страны
     if data == "filter_country":
-        # Устанавливаем флаг ожидания ввода
+        current_filters = await get_current_filters(chat_id)
+        if chat_id not in user_sessions:
+            user_sessions[chat_id] = {}
+        user_sessions[chat_id]["filters"] = current_filters
         if chat_id not in user_input_waiting:
             user_input_waiting[chat_id] = {}
-        user_input_waiting[chat_id]["waiting_country"] = True
+        user_input_waiting[chat_id]["waiting_country_name"] = True
 
-        # Удаляем текущее сообщение с меню
-        try:
-            await bot.delete_message(chat_id, old_msg_id)
-        except:
-            pass
-
-        # Отправляем сообщение с инструкцией и сохраняем его ID
-        msg = await callback.message.answer(
-            "🌍 Введите название страны на английском (например: RU, US, FR):\n\n"
-            "❌ Чтобы убрать фильтр страны, введите 'any'"
+        await navigate_to_menu(
+            chat_id,
+            old_msg_id,
+            "🌍 Выберите страну кнопкой или напишите название в чат:",
+            kb_country_selection(current_filters, page=0)
         )
-        user_input_waiting[chat_id]["message_id"] = msg.message_id
+        return
+
+    if data.startswith("country_page_"):
+        page = int(data.split("_")[2])
+        current_filters = user_sessions.get(chat_id, {}).get("filters") or await get_current_filters(chat_id)
+        if chat_id not in user_sessions:
+            user_sessions[chat_id] = {}
+        user_sessions[chat_id]["filters"] = current_filters
+
+        await callback.message.edit_text(
+            "🌍 Выберите страну кнопкой или напишите название в чат:",
+            reply_markup=kb_country_selection(current_filters, page=page)
+        )
+        return
+
+    if data.startswith("set_country_"):
+        country_code = data.replace("set_country_", "", 1).upper()
+        if chat_id not in user_sessions:
+            user_sessions[chat_id] = {}
+        if "filters" not in user_sessions[chat_id]:
+            user_sessions[chat_id]["filters"] = await get_current_filters(chat_id)
+
+        user_sessions[chat_id]["filters"]["country"] = country_code
+        await save_search_filters(chat_id, user_sessions[chat_id]["filters"])
+        if chat_id in user_input_waiting:
+            user_input_waiting[chat_id]["waiting_country_name"] = False
+
+        country_name = get_country_display_name(country_code)
+        await callback.answer(f"✅ Страна установлена: {get_country_flag(country_code)} {country_name}")
+        current_filters = user_sessions[chat_id]["filters"]
+        await navigate_to_menu(chat_id, old_msg_id, "Настройте фильтры поиска:", kb_filters_menu(current_filters))
+        return
+
+    if data == "clear_country":
+        if chat_id not in user_sessions:
+            user_sessions[chat_id] = {}
+        if "filters" not in user_sessions[chat_id]:
+            user_sessions[chat_id]["filters"] = await get_current_filters(chat_id)
+
+        user_sessions[chat_id]["filters"]["country"] = None
+        await save_search_filters(chat_id, user_sessions[chat_id]["filters"])
+        if chat_id in user_input_waiting:
+            user_input_waiting[chat_id]["waiting_country_name"] = False
+        await callback.answer("✅ Фильтр страны убран")
+
+        current_filters = user_sessions[chat_id]["filters"]
+        await navigate_to_menu(chat_id, old_msg_id, "Настройте фильтры поиска:", kb_filters_menu(current_filters))
+        return
+
+    if data == "country_back_filters":
+        if chat_id in user_input_waiting:
+            user_input_waiting[chat_id]["waiting_country_name"] = False
+        current_filters = user_sessions.get(chat_id, {}).get("filters") or await get_current_filters(chat_id)
+        await navigate_to_menu(chat_id, old_msg_id, "Настройте фильтры поиска:", kb_filters_menu(current_filters))
+        return
+
+    if data == "country_current":
+        await callback.answer()
         return
 
     if data == "filter_rating":
@@ -3112,27 +3379,6 @@ async def handle_callback(callback: types.CallbackQuery):
         await navigate_to_menu(chat_id, old_msg_id, "Настройте фильтры поиска:", kb_filters_menu(current_filters))
         return
 
-    # Переключение страны
-    if data == "filter_country":
-        # Устанавливаем флаг ожидания ввода
-        if chat_id not in user_input_waiting:
-            user_input_waiting[chat_id] = {}
-        user_input_waiting[chat_id]["waiting_country"] = True
-
-        # Удаляем текущее сообщение с меню
-        try:
-            await bot.delete_message(chat_id, old_msg_id)
-        except:
-            pass
-
-        # Отправляем сообщение с инструкцией и сохраняем его ID
-        msg = await callback.message.answer(
-            "🌍 Введите название страны на английском (например: RU, US, FR):\n\n"
-            "❌ Чтобы убрать фильтр страны, введите 'any'"
-        )
-        user_input_waiting[chat_id]["message_id"] = msg.message_id
-        return
-
     # Очистка фильтров
     if data == "clear_year":
         if chat_id in user_sessions and "filters" in user_sessions[chat_id]:
@@ -3156,6 +3402,8 @@ async def handle_callback(callback: types.CallbackQuery):
 
     # Сброс всех фильтров
     if data == "reset_all_filters":
+        if chat_id in user_input_waiting:
+            user_input_waiting[chat_id]["waiting_country_name"] = False
         try:
             await bot.delete_message(chat_id, old_msg_id)
         except:
@@ -3218,7 +3466,9 @@ async def handle_callback(callback: types.CallbackQuery):
 
     # Главное меню поиска
     if data == "search_menu":
-        await navigate_to_menu(chat_id, old_msg_id, "Выберите тип поиска:", kb_search_menu())
+        if chat_id in user_input_waiting:
+            user_input_waiting[chat_id]["waiting_country_name"] = False
+        await navigate_to_menu(chat_id, old_msg_id, "Выберите тип поиска:", await get_search_menu_keyboard(chat_id))
         return
 
     # Меню случайного поиска
@@ -3519,6 +3769,8 @@ async def handle_callback(callback: types.CallbackQuery):
 
     # Назад в главное меню
     if data == "back_to_main":
+        if chat_id in user_input_waiting:
+            user_input_waiting[chat_id]["waiting_country_name"] = False
         try:
             await bot.delete_message(chat_id, old_msg_id)
         except Exception:
@@ -3557,7 +3809,8 @@ async def handle_callback(callback: types.CallbackQuery):
         # Получаем активные фильтры пользователя
         current_filters = await get_current_filters(chat_id)
 
-        items = await discover_tmdb(type_, filters=current_filters)  # ДОБАВЬ await
+        user_is_adult = await is_user_adult(chat_id)
+        items = await discover_tmdb(type_, filters=current_filters, is_adult=user_is_adult)
         if user_filters.get(chat_id, {}).get("exclude_watched"):
             items = await filter_watched_items(chat_id, items, type_)
         if not items:
@@ -3574,6 +3827,15 @@ async def handle_callback(callback: types.CallbackQuery):
 
     # Поиск по жанрам (с применением фильтров)
     if data == "search_genre":
+        requests_info = await get_requests_info(chat_id)
+        if not requests_info["has_subscription"]:
+            await callback.answer(
+                "❌ Случайный поиск по жанрам доступен только с подпиской!\n\n"
+                "💫 Подписка откроет все возможности поиска!",
+                show_alert=True
+            )
+            return
+
         await navigate_to_menu(chat_id, old_msg_id, "Выберите тип:",
                                InlineKeyboardMarkup(inline_keyboard=[
                                    [InlineKeyboardButton(text="🎬 Фильмы", callback_data="genre_type_movie")],
@@ -3605,7 +3867,8 @@ async def handle_callback(callback: types.CallbackQuery):
         # Получаем активные фильтры пользователя
         current_filters = await get_current_filters(chat_id)
 
-        items = await discover_tmdb(type_, genre_id=gid, filters=current_filters)
+        user_is_adult = await is_user_adult(chat_id)
+        items = await discover_tmdb(type_, genre_id=gid, filters=current_filters, is_adult=user_is_adult)
         if not items:
             await callback.message.answer("По этому жанру ничего не найдено.")
             return
@@ -3692,6 +3955,10 @@ async def handle_callback(callback: types.CallbackQuery):
             await callback.answer("Ошибка: некорректный ID.")
             return
 
+        if not await can_show_content_to_user(chat_id, type_, tmdb_id):
+            await callback.answer("🔞 Этот контент скрыт из-за возрастного ограничения", show_alert=True)
+            return
+
         details = get_item_details(type_, tmdb_id)
         if not details:
             await callback.message.answer("Не удалось загрузить данные.")
@@ -3700,6 +3967,7 @@ async def handle_callback(callback: types.CallbackQuery):
         title = details.get("title") or details.get("name") or "Без названия"
         year = (details.get("release_date") or details.get("first_air_date") or "")[:4]
         rating = details.get("vote_average") or "—"
+        genre_text = get_genres_text(details)
         overview = details.get("overview") or "Описание отсутствует."
         poster = f"https://image.tmdb.org/t/p/w500{details.get('poster_path')}" if details.get("poster_path") else None
         avg_ratings = await get_ratings(tmdb_id, type_)
@@ -3712,9 +3980,9 @@ async def handle_callback(callback: types.CallbackQuery):
 
 
 
-        def create_safe_caption(title, year, rating, avg_ratings, overview):
+        def create_safe_caption(title, year, rating, avg_ratings, overview, genre_text):
             """Создает caption гарантированно не длиннее 1024 символов"""
-            base_info = f"{title} ({year})\n⭐ {rating} | 👍 {avg_ratings['likes']} | 👎 {avg_ratings['dislikes']} | 👀 {avg_ratings['watches']}"
+            base_info = f"{title} ({year})\n⭐ {rating} | 👍 {avg_ratings['likes']} | 👎 {avg_ratings['dislikes']} | 👀 {avg_ratings['watches']}\n{genre_text}"
 
             if watched:
                 base_info += "\n\n✅ Вы смотрели"
@@ -3722,32 +3990,12 @@ async def handle_callback(callback: types.CallbackQuery):
             if is_hidden:
                 base_info += "\n🙈 Скрыто от друзей"
 
-            base_info += "\n\n"
-
-            # Максимальная длина для Telegram caption
-            max_total = 1024
-            available = max_total - len(base_info) - 3  # -3 для "..."
-
-            if available <= 50:  # Если почти нет места для описания
-                return base_info.strip()
-
-            if len(overview) > available:
-                overview = overview[:available] + "..."
-
-            return base_info + overview
+            return append_limited_overview(base_info, overview)
 
         # Используйте так:
-        caption = create_safe_caption(title, year, rating, avg_ratings, overview)
+        caption = create_safe_caption(title, year, rating, avg_ratings, overview, genre_text)
 
-        # Добавляем информацию о провайдерах для РФ (если есть)
-        try:
-            prov = get_providers_ru(type_, tmdb_id)
-            if prov:
-                prov_text = f"\n\nГде смотреть: {prov}"
-                if len(caption) + len(prov_text) <= 1024:
-                    caption += prov_text
-        except Exception:
-            pass
+        caption = append_watch_providers(caption, type_, tmdb_id)
 
 
         try:
@@ -3757,9 +4005,11 @@ async def handle_callback(callback: types.CallbackQuery):
 
         if poster:
             await bot.send_photo(chat_id, photo=poster, caption=caption,
+                                 parse_mode="HTML",
                                  reply_markup=kb_collection_item(tmdb_id, type_, watched, liked, disliked, is_hidden))
         else:
             await bot.send_message(chat_id, text=caption,
+                                   parse_mode="HTML",
                                    reply_markup=kb_collection_item(tmdb_id, type_, watched, liked, disliked, is_hidden))
         return
 
@@ -3773,6 +4023,10 @@ async def handle_callback(callback: types.CallbackQuery):
 
         tmdb_id = int(parts[1])
         type_ = parts[2]
+
+        if not await can_show_content_to_user(chat_id, type_, tmdb_id):
+            await callback.answer("🔞 Этот контент недоступен из-за возрастного ограничения", show_alert=True)
+            return
 
         # НЕ ИСПОЛЬЗУЕМ СЕССИЮ ИЗ ПОИСКА ПО НАЗВАНИЮ
         # Вместо этого получаем детали напрямую по tmdb_id
@@ -4252,10 +4506,10 @@ async def send_preference_item(chat_id, old_msg_id=None):
     # Добавляем в список показанных
     session["shown_recommendations"].append(chosen_item["id"])
 
-    # Проверяем, не забанен ли контент
-    if await is_banned(chosen_item["id"], liked_item["type"]):
+    # Проверяем, можно ли показывать контент пользователю
+    if not await can_show_content_to_user(chat_id, liked_item["type"], chosen_item["id"]):
         print(
-            f"DEBUG: Пропускаем забаненный контент в рекомендациях - ID: {chosen_item['id']}, Type: {liked_item['type']}")
+            f"DEBUG: Пропускаем контент в рекомендациях по ограничениям - ID: {chosen_item['id']}, Type: {liked_item['type']}")
         await send_preference_item(chat_id, old_msg_id)
         return
 
@@ -4287,6 +4541,7 @@ async def send_preference_item(chat_id, old_msg_id=None):
     title = details.get("title") or details.get("name") or "Без названия"
     year = (details.get("release_date") or details.get("first_air_date") or "")[:4]
     rating = details.get("vote_average") or "—"
+    genre_text = get_genres_text(details)
     overview = details.get("overview") or "Описание отсутствует."
     if len(overview) > 2000:
         overview = overview[:2000] + "..."
@@ -4296,9 +4551,9 @@ async def send_preference_item(chat_id, old_msg_id=None):
     user_rating = await get_user_rating(chat_id, chosen_item["id"], liked_item["type"])
     watched_text = "✅ Вы смотрели" if user_rating and user_rating["watched"] else ""
 
-    def create_safe_caption(title, year, rating, avg_ratings, watched_text, overview):
+    def create_safe_caption(title, year, rating, avg_ratings, watched_text, overview, genre_text):
         """Создает caption гарантированно не длиннее 1024 символов"""
-        base_info = f"{title} ({year})\n⭐ {rating} | 👍 {avg_ratings['likes']} | 👎 {avg_ratings['dislikes']} | 👀 {avg_ratings['watches']}"
+        base_info = f"{title} ({year})\n⭐ {rating} | 👍 {avg_ratings['likes']} | 👎 {avg_ratings['dislikes']} | 👀 {avg_ratings['watches']}\n{genre_text}"
         if watched_text:
             base_info += f"\n{watched_text}"
 
@@ -4319,18 +4574,13 @@ async def send_preference_item(chat_id, old_msg_id=None):
     # Используйте так:
     caption = (
         f"<b>{title}</b> ({year})\n"
-        f"⭐ {rating} | 👍{avg_ratings['likes']} | 👎{avg_ratings['dislikes']} | 👀{avg_ratings['watches']}"
+        f"⭐ {rating} | 👍{avg_ratings['likes']} | 👎{avg_ratings['dislikes']} | 👀{avg_ratings['watches']}\n"
+        f"{genre_text}"
     )
     if watched_text:
         caption += f"\n{watched_text}"
 
-    caption += "\n\n"
-
-    # Добавляем описание как раскрываемую цитату
-    if overview and overview != "Описание отсутствует.":
-        caption += f"<blockquote expandable>{overview}</blockquote>"
-    else:
-        caption += "Описание отсутствует."
+    caption = append_limited_overview(caption, overview)
 
 
     # Клавиатура для рекомендаций
@@ -4449,13 +4699,34 @@ async def send_friend_recommendation_card(chat_id, old_msg_id=None):
         return
 
     recommendations = session["friends_recommendations"]
+
+    # Возрастная фильтрация рекомендаций друзей.
+    # Если пользователь не 18+, скрываем 18+ и контент без RU-сертификации.
+    visible_recommendations = []
+    for rec_item in recommendations:
+        rec_tmdb_id = rec_item.get("tmdb_id")
+        rec_type = rec_item.get("type", "movie")
+        if rec_tmdb_id and await can_show_content_to_user(chat_id, rec_type, rec_tmdb_id):
+            visible_recommendations.append(rec_item)
+
+    if not visible_recommendations:
+        await navigate_to_menu(
+            chat_id, old_msg_id,
+            "📭 Нет доступных рекомендаций с учетом возрастных ограничений.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="friends_menu")],
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_to_main")]
+            ])
+        )
+        return
+
     index = session.get("friends_rec_index", 0)
 
-    if index >= len(recommendations):
+    if index >= len(visible_recommendations):
         session["friends_rec_index"] = 0
         index = 0
 
-    rec = recommendations[index]
+    rec = visible_recommendations[index]
 
     title = rec.get('title', 'Без названия')
     tmdb_id = rec.get('tmdb_id')
@@ -4508,22 +4779,30 @@ async def send_friend_recommendation_card(chat_id, old_msg_id=None):
 
     friend_likes = len(friend_usernames)
 
+    if not await can_show_content_to_user(chat_id, type_, tmdb_id):
+        session["friends_rec_index"] = index + 1
+        await send_friend_recommendation_card(chat_id, old_msg_id)
+        return
+
     # Получаем детали
     details = get_item_details(type_, tmdb_id)
 
     if details:
         year = (details.get('release_date') or details.get('first_air_date') or '')[:4]
         rating = details.get('vote_average', '—')
+        country_text = get_production_countries_text(details)
         poster = f"https://image.tmdb.org/t/p/w500{details.get('poster_path')}" if details.get('poster_path') else None
     else:
         year = "—"
         rating = "—"
+        country_text = "🌍 Страна: не указана"
         poster = None
 
     caption = (
         f"👥 Рекомендация от друзей\n\n"
         f"🎬 {title} ({year})\n"
         f"⭐ Рейтинг: {rating} (TMDB)\n"
+        f"{country_text}\n"
         f"👍 Лайков от друзей: {friend_likes}\n"
         f"👤 Понравился: {friends_mention}\n\n"
         f"💡 Ваши друзья посмотрели и оценили этот фильм!"
@@ -4575,6 +4854,7 @@ async def get_search_menu_keyboard(chat_id: int):
         # Полное меню поиска для подписчиков
         return InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🎲 Случайный поиск", callback_data="random_search")],
+            [InlineKeyboardButton(text="🧭 Случайный поиск по жанрам", callback_data="search_genre")],
             [InlineKeyboardButton(text="🔍 Поиск по названию", callback_data="search_by_title")],
             [InlineKeyboardButton(text="🎭 Поиск по актеру", callback_data="search_by_person")],
             [InlineKeyboardButton(text="🎯 На основе предпочтений", callback_data="preferences")],
@@ -4585,6 +4865,7 @@ async def get_search_menu_keyboard(chat_id: int):
         # Ограниченное меню поиска для обычных пользователей
         return InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🎲 Случайный поиск", callback_data="random_search")],
+            [InlineKeyboardButton(text="🧭 Случайный поиск по жанрам 🔒", callback_data="premium_locked")],
             [InlineKeyboardButton(text="🔍 Поиск по названию 🔒", callback_data="premium_locked")],
             [InlineKeyboardButton(text="🎭 Поиск по актеру 🔒", callback_data="premium_locked")],
             [InlineKeyboardButton(text="🎯 На основе предпочтений 🔒", callback_data="premium_locked")],
@@ -4603,7 +4884,6 @@ async def get_random_search_keyboard(chat_id: int):
         return InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🎬 Случайный фильм", callback_data="discover_movie")],
             [InlineKeyboardButton(text="📺 Случайный сериал", callback_data="discover_tv")],
-            [InlineKeyboardButton(text="🧭 Случайный поиск по жанрам", callback_data="search_genre")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="search_menu")],
         ])
     else:
@@ -4611,7 +4891,6 @@ async def get_random_search_keyboard(chat_id: int):
         return InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🎬 Случайный фильм", callback_data="discover_movie")],
             [InlineKeyboardButton(text="📺 Случайный сериал", callback_data="discover_tv")],
-            [InlineKeyboardButton(text="🧭 Поиск по жанрам 🔒", callback_data="premium_locked")],
             [InlineKeyboardButton(text="💫 Получить подписку", callback_data="subscription_management")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="search_menu")],
         ])
@@ -4798,11 +5077,13 @@ async def send_card(chat_id, old_msg_id=None):
         # Получаем активные фильтры
         current_filters = await get_current_filters(chat_id)
 
-        # Загружаем новые результаты
+        # Загружаем новые результаты с учетом возрастной фильтрации
+        user_is_adult = await is_user_adult(chat_id)
         new_results = await discover_tmdb(
             session["type"],
             session.get("genre_id"),
-            filters=current_filters
+            filters=current_filters,
+            is_adult=user_is_adult
         )
 
         if not new_results:
@@ -4857,6 +5138,15 @@ async def send_card(chat_id, old_msg_id=None):
             attempts += 1
             continue
 
+        # Проверяем возрастное ограничение прямо перед показом карточки.
+        # Это важно для сериалов: /discover/tv не умеет надежно фильтровать 18+.
+        user_is_adult = await is_user_adult(chat_id)
+        if not is_content_allowed_by_age(session["type"], item["id"], user_is_adult):
+            print(f"DEBUG: Пропускаем контент по возрастному ограничению - ID: {item['id']}")
+            session["index"] += 1
+            attempts += 1
+            continue
+
         # Получаем детали
         details = get_item_details(session["type"], item["id"])
         if not details:
@@ -4889,6 +5179,7 @@ async def send_card(chat_id, old_msg_id=None):
         title = details.get("title") or details.get("name") or "Без названия"
         year = (details.get("release_date") or details.get("first_air_date") or "")[:4]
         rating = details.get("vote_average") or "—"
+        genre_text = get_genres_text(details)
         overview = details.get("overview") or "Описание отсутствует."
         if len(overview) > 2000:
             overview = overview[:2000] + "..."
@@ -4902,18 +5193,13 @@ async def send_card(chat_id, old_msg_id=None):
 
         caption = (
             f"<b>{title}</b> ({year})\n"
-            f"⭐ {rating} | 👍 {avg_ratings['likes']} | 👎 {avg_ratings['dislikes']} | 👀 {avg_ratings['watches']}"
+            f"⭐ {rating} | 👍 {avg_ratings['likes']} | 👎 {avg_ratings['dislikes']} | 👀 {avg_ratings['watches']}\n"
+        f"{genre_text}"
         )
         if watched_text:
             caption += f"\n{watched_text}"
 
-        caption += "\n\n"
-
-        # Добавляем описание как раскрываемую цитату
-        if overview and overview != "Описание отсутствует.":
-            caption += f"<blockquote expandable>{overview}</blockquote>"
-        else:
-            caption += "Описание отсутствует."
+        caption = append_limited_overview(caption, overview)
 
         # Добавляем провайдеров (если помещаются)
         try:
@@ -5078,6 +5364,7 @@ async def handle_rating(callback, action, tmdb_id=None, type_=None):
     liked = user_rating["liked"] if user_rating else False
     disliked = user_rating["disliked"] if user_rating else False
     watched = user_rating["watched"] if user_rating else False
+    is_hidden = user_rating["is_hidden"] if user_rating else False
 
     # Обновляем значения
     if action == "like":
@@ -5095,6 +5382,10 @@ async def handle_rating(callback, action, tmdb_id=None, type_=None):
 
     print(f"DEBUG: after change - liked={liked}, disliked={disliked}, watched={watched}")
 
+    if not await can_show_content_to_user(chat_id, type_, tmdb_id):
+        await callback.answer("🔞 Этот контент скрыт из-за возрастного ограничения", show_alert=True)
+        return
+
     details = get_item_details(type_, tmdb_id)
     title = details.get("title") or details.get("name") or "Без названия"
 
@@ -5106,46 +5397,45 @@ async def handle_rating(callback, action, tmdb_id=None, type_=None):
     watched_text = "✅ Вы смотрели" if watched else ""
     year = (details.get("release_date") or details.get("first_air_date") or "")[:4]
     rating_tmdb = details.get("vote_average") or "—"
+    genre_text = get_genres_text(details)
     overview = details.get("overview") or "Описание отсутствует."
     if len(overview) > 2000:
         overview = overview[:2000] + "..."
-    poster = f"https://image.tmdb.org/t/p/w500{details.get('poster_path')}" if details.get("poster_path") else None
     caption = (
         f"<b>{title}</b> ({year})\n"
-        f"⭐ {rating_tmdb} | 👍{avg_ratings['likes']} | 👎{avg_ratings['dislikes']} | 👀{avg_ratings['watches']}"
+        f"⭐ {rating_tmdb} | 👍{avg_ratings['likes']} | 👎{avg_ratings['dislikes']} | 👀{avg_ratings['watches']}\n"
+        f"{genre_text}"
     )
     if watched_text:
         caption += f"\n{watched_text}"
 
-    caption += "\n\n"
-
-    # Добавляем описание как раскрываемую цитату
-    if overview and overview != "Описание отсутствует.":
-        caption += f"<blockquote expandable>{overview}</blockquote>"
-    else:
-        caption += "Описание отсутствует."
+    caption = append_limited_overview(caption, overview)
+    caption = append_watch_providers(caption, type_, tmdb_id)
+    keyboard = kb_collection_item(tmdb_id, type_, watched, liked, disliked, is_hidden)
 
     try:
-        if poster and callback.message.photo:
-            await bot.edit_message_media(
-                chat_id=chat_id,
-                message_id=callback.message.message_id,
-                media=types.InputMediaPhoto(media=poster, caption=caption),
-                parse_mode="HTML",
-                reply_markup=kb_collection_item(tmdb_id, type_, watched, liked, disliked)
-            )
-        else:
+        if callback.message.photo or callback.message.caption is not None:
             await bot.edit_message_caption(
                 chat_id=chat_id,
                 message_id=callback.message.message_id,
                 caption=caption,
                 parse_mode="HTML",
-                reply_markup=kb_collection_item(tmdb_id, type_, watched, liked, disliked)
+                reply_markup=keyboard
+            )
+        else:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=callback.message.message_id,
+                text=caption,
+                parse_mode="HTML",
+                reply_markup=keyboard
             )
     except Exception as e:
         print(f"Ошибка при обновлении карточки: {e}")
-        # Если не удалось отредактировать, просто отправляем уведомление
-        await callback.answer("✅ Обновлено!")
+        try:
+            await callback.message.edit_reply_markup(reply_markup=keyboard)
+        except Exception as markup_error:
+            print(f"Ошибка при обновлении кнопок карточки: {markup_error}")
 
 
 # -------------------- RUN --------------------
