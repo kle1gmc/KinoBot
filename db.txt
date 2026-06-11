@@ -1,0 +1,107 @@
+-- Создание таблицы пользователей
+CREATE TABLE IF NOT EXISTS users
+(
+    user_id SERIAL PRIMARY KEY,
+    tg_id BIGINT NOT NULL UNIQUE,
+    username TEXT,
+    disable_anime BOOLEAN DEFAULT FALSE,
+    disable_cartoons BOOLEAN DEFAULT FALSE,
+    hide_watched boolean DEFAULT false,
+    agreement_accepted BOOLEAN DEFAULT FALSE,
+    agreement_accepted_at TIMESTAMP
+);
+
+-- Создание таблицы для отслеживания запросов пользователей
+CREATE TABLE IF NOT EXISTS user_requests (
+    request_id SERIAL PRIMARY KEY,
+    user_id INT REFERENCES users(user_id) ON DELETE CASCADE,
+    request_type TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Создание таблицы для коллекции пользователя
+CREATE TABLE IF NOT EXISTS collection
+(
+    collection_id SERIAL PRIMARY KEY,
+    user_id INT REFERENCES users(user_id) ON DELETE CASCADE,
+    tmdb_id INT NOT NULL,
+    type TEXT NOT NULL,
+    title TEXT,
+    year TEXT,
+    poster_path TEXT,
+    added_at timestamp DEFAULT now()
+);
+
+-- Создание таблицы для рейтингов (лайков/дизлайков/просмотров)
+CREATE TABLE IF NOT EXISTS ratings
+(
+    rating_id SERIAL PRIMARY KEY,
+    tmdb_id INT NOT NULL,
+    type TEXT NOT NULL,
+    title TEXT,
+    user_id INT REFERENCES users(user_id) ON DELETE CASCADE,
+    liked BOOLEAN DEFAULT FALSE,
+    disliked BOOLEAN DEFAULT FALSE,
+    watched BOOLEAN DEFAULT FALSE,
+    is_hidden BOOLEAN DEFAULT FALSE,
+    CONSTRAINT unique_user_rating UNIQUE (user_id, tmdb_id, type)
+);
+
+-- Создание таблицы для пользовательских фильтров
+CREATE TABLE IF NOT EXISTS user_filters
+(
+    filter_id SERIAL PRIMARY KEY,
+    user_id INT REFERENCES users(user_id) ON DELETE CASCADE,
+    start_year INT,
+    end_year INT,
+    country_code VARCHAR(10),
+    min_rating DECIMAL(3,1),
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
+    CONSTRAINT unique_user_filter UNIQUE (user_id)
+);
+
+-- Создание индекса для user_filters
+CREATE INDEX IF NOT EXISTS idx_user_filters_user_id ON user_filters(user_id);
+
+-- Создание таблицы для забаненного контента
+CREATE TABLE IF NOT EXISTS banned_content (
+    ban_id SERIAL PRIMARY KEY,
+    tmdb_id INT NOT NULL,
+    type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    banned_by BIGINT,
+    banned_at TIMESTAMP DEFAULT NOW(),
+    reason TEXT,
+    CONSTRAINT unique_banned_item UNIQUE (tmdb_id, type)
+);
+
+-- Создание таблицы для друзей пользователя
+CREATE TABLE IF NOT EXISTS user_friends (
+    friendship_id SERIAL PRIMARY KEY,
+    user_id INT REFERENCES users(user_id) ON DELETE CASCADE,
+    friend_user_id INT REFERENCES users(user_id) ON DELETE CASCADE,
+    created_at TIMESTAMP DEFAULT NOW(),
+    CONSTRAINT unique_friendship UNIQUE (user_id, friend_user_id)
+);
+
+-- Создание таблицы для запросов в друзья
+CREATE TABLE IF NOT EXISTS friend_requests (
+    request_id SERIAL PRIMARY KEY,
+    from_user_id INT REFERENCES users(user_id) ON DELETE CASCADE,
+    to_user_id INT REFERENCES users(user_id) ON DELETE CASCADE,
+    status TEXT DEFAULT 'pending', -- pending, accepted, rejected
+    created_at TIMESTAMP DEFAULT NOW(),
+    CONSTRAINT unique_friend_request UNIQUE (from_user_id, to_user_id)
+);
+
+-- Создание таблицы для подписок пользователя
+CREATE TABLE IF NOT EXISTS user_subscriptions (
+    subscription_id SERIAL PRIMARY KEY,
+    user_id INT REFERENCES users(user_id) ON DELETE CASCADE,
+    is_active BOOLEAN DEFAULT FALSE,
+    expires_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
+    CONSTRAINT unique_user_subscription UNIQUE (user_id)
+);
