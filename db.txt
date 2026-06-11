@@ -9,6 +9,9 @@ CREATE TABLE IF NOT EXISTS users
     hide_watched boolean DEFAULT false,
     agreement_accepted BOOLEAN DEFAULT FALSE,
     agreement_accepted_at TIMESTAMP
+    age_confirmed boolean DEFAULT false,
+    age_confirmed_at timestamp without time zone,
+    is_adult boolean DEFAULT NULL
 );
 
 -- Создание таблицы для отслеживания запросов пользователей
