@@ -19,6 +19,13 @@ from . import state
 from .state import user_sessions, user_filters, user_input_waiting
 from .config import bot, dp
 from .support import *
+from .yookassa_payments import (
+    ADMIN_SUPPORT_URL,
+    SUBSCRIPTION_TARIFFS,
+    create_subscription_payment,
+    kb_subscription_tariffs,
+    yookassa_is_configured,
+)
 
 
 async def can_show_content_to_user(tg_id: int, type_: str, tmdb_id: int) -> bool:
@@ -1512,12 +1519,43 @@ async def buy_subscription_handler(callback: types.CallbackQuery):
     """Покупка подписки"""
     await callback.message.edit_text(
         "💳 <b>Приобретение подписки</b>\n\n"
-        "Для приобретения подписки обратитесь к администратору\n\n"
-        "<i>После оплаты администратор активирует вашу подписку</i>",
+        "Выберите тариф. После успешной оплаты подписка активируется автоматически.",
+        parse_mode="HTML",
+        reply_markup=kb_subscription_tariffs()
+    )
+
+
+@dp.callback_query(lambda c: c.data.startswith("pay_subscription_"))
+async def pay_subscription_handler(callback: types.CallbackQuery):
+    """Создание платежа ЮKassa для выбранного тарифа"""
+    tariff_id = callback.data.replace("pay_subscription_", "", 1)
+    tariff = SUBSCRIPTION_TARIFFS.get(tariff_id)
+    if not tariff:
+        await callback.answer("❌ Тариф не найден", show_alert=True)
+        return
+
+    if not yookassa_is_configured():
+        await callback.answer("❌ Оплата пока не настроена", show_alert=True)
+        return
+
+    try:
+        payment = await create_subscription_payment(callback.message.chat.id, tariff_id)
+        confirmation_url = payment["confirmation"]["confirmation_url"]
+    except Exception as exc:
+        print(f"YooKassa create payment failed: {exc}")
+        await callback.answer("❌ Не удалось создать платеж. Попробуйте позже.", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        f"💳 <b>Оплата подписки</b>\n\n"
+        f"Тариф: <b>{tariff['title']}</b>\n"
+        f"Сумма: <b>{tariff['price']} ₽</b>\n\n"
+        "Нажмите кнопку ниже и завершите тестовую оплату. После успешной оплаты бот активирует подписку автоматически.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👨‍💼 Написать администратору", url="https://t.me/donk1337228")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="subscription_management")]
+            [InlineKeyboardButton(text="💳 Перейти к оплате", url=confirmation_url)],
+            [InlineKeyboardButton(text="👨‍💼 Обратиться к администрации", url=ADMIN_SUPPORT_URL)],
+            [InlineKeyboardButton(text="⬅️ Назад к тарифам", callback_data="buy_subscription")]
         ])
     )
 
@@ -1536,12 +1574,9 @@ async def extend_my_subscription_handler(callback: types.CallbackQuery):
         f"📅 <b>Продление подписки</b>\n\n"
         f"Текущая подписка истекает через {requests_info['days_left']} дней\n"
         f"Дата истечения: {(datetime.now() + timedelta(days=requests_info['days_left'])).strftime('%d.%m.%Y')}\n\n"
-        "Для продления подписки обратитесь к администратору:",
+        "Выберите тариф для продления. После оплаты дни добавятся к текущей подписке.",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👨‍💼 Написать администратору", url="https://t.me/donk1337228")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="subscription_management")]
-        ])
+        reply_markup=kb_subscription_tariffs()
     )
 
 
@@ -1557,7 +1592,7 @@ async def subscription_info_handler(callback: types.CallbackQuery):
         "• 1 месяц - 75 руб.\n"
         "• 3 месяца - 190 руб. (скидка 15%)\n"
         "• 12 месяцев - 630 руб. (скидка 30%)\n\n"
-        "<i>Для приобретения подписки обратитесь к администратору</i>",
+        "<i>Выберите тариф и оплатите его прямо в боте</i>",
         parse_mode="HTML",
         reply_markup=kb_subscription_info()
     )
